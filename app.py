@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from dotenv import load_dotenv
 from openai import OpenAI
 import json
@@ -6,18 +8,25 @@ import requests
 from pypdf import PdfReader
 import gradio as gr
 
-
 load_dotenv(override=True)
 
-def push(text):
-    requests.post(
-        "https://api.pushover.net/1/messages.json",
-        data={
-            "token": os.getenv("PUSHOVER_TOKEN"),
-            "user": os.getenv("PUSHOVER_USER"),
-            "message": text,
-        }
-    )
+# Paths relative to this file (works when run from any CWD, e.g. Hugging Face Spaces)
+APP_DIR = Path(__file__).resolve().parent
+
+
+def push(text: str) -> None:
+    """Send a notification via Pushover. No-op if credentials are missing or request fails."""
+    token, user = os.getenv("PUSHOVER_TOKEN"), os.getenv("PUSHOVER_USER")
+    if not token or not user:
+        return
+    try:
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={"token": token, "user": user, "message": text},
+            timeout=10,
+        )
+    except requests.RequestException:
+        pass  # Don't fail the app if Pushover is down or unreachable
 
 
 def record_user_details(email, name="Name not provided", notes="not provided"):
@@ -41,8 +50,7 @@ record_user_details_json = {
             "name": {
                 "type": "string",
                 "description": "The user's name, if they provided it"
-            }
-            ,
+            },
             "notes": {
                 "type": "string",
                 "description": "Any additional information about the conversation that's worth recording to give context"
@@ -69,8 +77,10 @@ record_unknown_question_json = {
     }
 }
 
-tools = [{"type": "function", "function": record_user_details_json},
-        {"type": "function", "function": record_unknown_question_json}]
+TOOLS = [
+    {"type": "function", "function": record_user_details_json},
+    {"type": "function", "function": record_unknown_question_json},
+]
 
 # -------------------------------------------------------
 # Main Class — Bharat Puri's AI Twin
@@ -80,14 +90,29 @@ class Me:
     def __init__(self):
         self.openai = OpenAI()
         self.name = "Bharat Puri"
-        reader = PdfReader("me/linkedin.pdf")
-        self.linkedin = ""
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                self.linkedin += text
-        with open("me/summary.txt", "r", encoding="utf-8") as f:
-            self.summary = f.read()
+        self.linkedin = self._load_linkedin()
+        self.summary = self._load_summary()
+
+    def _load_linkedin(self) -> str:
+        path = APP_DIR / "me" / "linkedin.pdf"
+        if not path.exists():
+            return ""
+        try:
+            reader = PdfReader(path)
+            return "".join(
+                page.extract_text() or "" for page in reader.pages
+            ).strip()
+        except Exception:
+            return ""
+
+    def _load_summary(self) -> str:
+        path = APP_DIR / "me" / "summary.txt"
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
 
 
     def handle_tool_call(self, tool_calls):
@@ -118,10 +143,9 @@ class Me:
             "and record it using the `record_user_details` tool.\n"
         )
 
-        # Add summary and LinkedIn details if available
-        if hasattr(self, "summary") and self.summary:
+        if self.summary:
             system_prompt += f"\n## Summary:\n{self.summary}\n"
-        if hasattr(self, "linkedin") and self.linkedin:
+        if self.linkedin:
             system_prompt += f"\n## LinkedIn Profile:\n{self.linkedin}\n"
 
         system_prompt += (
@@ -136,8 +160,10 @@ class Me:
         messages = [{"role": "system", "content": self.system_prompt()}] + history + [{"role": "user", "content": message}]
         done = False
         while not done:
-            response = self.openai.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=tools)
-            if response.choices[0].finish_reason=="tool_calls":
+            response = self.openai.chat.completions.create(
+                model="gpt-4o-mini", messages=messages, tools=TOOLS
+            )
+            if response.choices[0].finish_reason == "tool_calls":
                 message = response.choices[0].message
                 tool_calls = message.tool_calls
                 results = self.handle_tool_call(tool_calls)
